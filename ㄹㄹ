@@ -1,13 +1,13 @@
-"""
-일일 AI/디지털 정책 뉴스 리포트 - 네이버 메일 전송 버전
-- Google News RSS로 기사 수집 → 정규화 후 SequenceMatcher 중복 제거(60%) → 키워드 필터링 → Gemini 2.5 Flash 요약 → 네이버 메일 전송
-"""
+# ─────────────────────────────────────────────
+# 일일 AI/디지털 정책 뉴스 리포트 - 네이버 메일 (HTML 포맷 및 JSON 파싱 적용)
+# ─────────────────────────────────────────────
 
 import os
 import sys
 import time
 import re
 import urllib.parse
+import json
 from datetime import datetime, timezone, timedelta
 import xml.etree.ElementTree as ET
 import requests
@@ -23,7 +23,7 @@ from email.mime.multipart import MIMEMultipart
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"].strip()
 NAVER_ID = os.environ["NAVER_ID"].strip()              
 NAVER_APP_PW = os.environ["NAVER_APP_PW"].strip()      
-RECIPIENT_EMAIL = os.environ["RECIPIENT_EMAIL"].strip()
+RECIPIENT_EMAIL = os.environ["RECIPIENT_EMAIL"].strip() 
 
 # ─────────────────────────────────────────────
 # 키워드 정의
@@ -42,7 +42,7 @@ CORPORATE_KEYWORDS = ["출시", "선보여", "이벤트", "할인", "사전예�
                       "공모", "기술력", "플랫폼", "서비스"]
 
 EXCLUDE_ORGANIZATIONS = ["대학", "대학교", "학교", "학원", "교육", "캠프", "졸업", "입학", "수강", "수료"]
-POLITICS_KEYWORDS = ["후보", "공약", "출마", "선거", "의원", "당선", "유세", "국회", "총선", "지선", "대선", "국힘", "민주당", "사설", "트럼프", "백악관"]
+POLITICS_KEYWORDS = ["후보", "공약", "출마", "선거", "의원", "당선", "유세", "국회", "총선", "지선", "대선", "국힘", "민주당","사설", "트럼프", "백악관", "총리"]
 GOV_KEYWORDS = ["정부", "부처", "시청", "도청", "지자체", "공공", "국가",
                "과학기술정보통신부", "중기부", "산업부"] + REGIONS
 
@@ -64,14 +64,17 @@ def fetch_news(query: str, limit: int = 20):
     for item in root.findall(".//item")[:limit]:
         title = (item.findtext("title") or "").strip()
         link = (item.findtext("link") or "").strip()
-        pub_date = (item.findtext("pubDate") or "").strip()
         source = item.find("source")
         source_name = source.text if source is not None else ""
+        
+        # 구글 뉴스가 강제로 붙인 ' - 언론사명'을 제목에서 안전하게 제거합니다.
+        if source_name:
+            title = re.sub(rf'\s*-\s*{re.escape(source_name)}$', '', title)
+
         if title and link:
             items.append({
                 "title": title,
                 "link": link,
-                "pub_date": pub_date,
                 "source": source_name,
             })
     return items
@@ -126,53 +129,90 @@ def collect_filtered_articles(max_total: int = 8):
     return all_articles[:max_total]
 
 # ─────────────────────────────────────────────
-# 3) Gemini 요약 (최신 SDK 적용)
+# 3) Gemini 요약 (JSON 데이터 파이프라인)
 # ─────────────────────────────────────────────
-def summarize_with_gemini(articles: list) -> str:
+def summarize_with_gemini_to_html(articles: list, today_str: str) -> str:
     if not articles:
-        return "오늘 조건에 맞는 기사가 없었습니다."
+        return f"<h2>📰 {today_str} AI 언론 동향 뉴스</h2><hr><p>오늘 조건에 맞는 기사가 없었습니다.</p>"
 
-    client = genai.Client(api_key=GEMINI_API_KEY) # 최신 클라이언트 선언 방식
-
-    titles_block = "\n".join([f"- {a['title']} ({a['source']})" for a in articles])
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    prompt_data = [{"index": i, "title": a['title']} for i, a in enumerate(articles)]
+    
+    # 에디터 버그 방지를 위해 따옴표 3개 대신 괄호와 일반 문자열 결합을 사용합니다.
     prompt = (
-        "다음은 오늘의 지역별 AI 언론 동향 뉴스 제목 목록이다.\n"
-        "각 항목을 한국어로 1~2줄로 핵심만 요약해라.\n"
-        "가독성을 위해 반드시 각 요약 항목 앞에 '□ 번호.' 기호를 붙여라. (예: □ 1. 제목 및 요약...)\n"
-        "정부/지자체 정책 동향과 사업 추진 내용에 초점을 맞춰라.\n"
-        "기사 검색 안될 시 추측 금지, 기사에 없는 내용은 만들지 마라.\n\n"
-        f"{titles_block}"
+        "다음은 오늘의 뉴스 기사 데이터이다. 각 기사를 분석하여 반드시 아래 지시사항에 따라 **JSON 배열(Array) 형태**로만 답변해라.\n\n"
+        "[지시사항]\n"
+        "1. \"summary\": 단순히 제목을 반복하지 마라. 기사의 핵심 내용(누가, 무엇을, 어떻게)과 목적(왜 이 사업/정책을 하는지)을 1~2줄로 명확하게 요약해라.\n"
+        "2. \"region\": 기사 내용과 관련된 지역명(예: 서울, 충남, 전남 등)을 추출해라. 지자체가 아니거나 명확하지 않으면 \"정부/종합\" 또는 \"전국\"으로 표기해라.\n"
+        "3. 다른 말은 절대 덧붙이지 말고 오직 JSON 포맷만 출력해라.\n\n"
+        "[입력 데이터]\n"
+        f"{json.dumps(prompt_data, ensure_ascii=False)}\n\n"
+        "[출력 포맷 예시]\n"
+        "[\n"
+        "  {\"index\": 0, \"region\": \"충남\", \"summary\": \"산업통상부 주도로 충남 예산군이 AI 로봇 기술 현장 실증을 통해 스마트팜 확산 기반을 다지는 사업이다.\"},\n"
+        "  {\"index\": 1, \"region\": \"종합\", \"summary\": \"...\"}\n"
+        "]"
     )
+
+    html_body = f"<h2 style='color: #2c3e50;'>📰 {today_str} AI 언론 동향 뉴스</h2><hr style='border: 1px solid #eee; margin-bottom: 20px;'>"
 
     try:
         resp = client.models.generate_content(
             model='gemini-2.5-flash',
             contents=prompt
         )
-        return resp.text.strip()
+        
+        raw_text = resp.text.strip()
+        if raw_text.startswith("```json"):
+            raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+        elif raw_text.startswith("```"):
+            raw_text = raw_text.replace("```", "").strip()
+            
+        summary_data = json.loads(raw_text)
+
+        for item in summary_data:
+            idx = item.get("index", 0)
+            region = item.get("region", "종합")
+            summary = item.get("summary", "요약 생성 중 일시적 오류 발생") 
+            art = articles[idx]
+
+            # 여기도 따옴표 3개를 제거하고 일반 문자열 결합을 사용합니다.
+            html_body += (
+                '<div style="margin-bottom: 25px; line-height: 1.6; font-family: \'Malgun Gothic\', sans-serif;">\n'
+                f'    <a href="{art["link"]}" style="text-decoration: none; font-size: 15px; font-weight: bold; color: #03c75a;">📍 {region}</a><br>\n'
+                f'    <span style="font-weight: bold; font-size: 15px; color: #333;">📌 {art["title"]}</span> <span style="font-size: 13px; color: #888;">- {art["source"]}</span><br>\n'
+                f'    <span style="font-size: 14px; color: #555;">✓ {summary}</span>\n'
+                '</div>\n'
+            )
+            
     except Exception as e:
-        print(f"[WARN] Gemini 요약 실패: {e}", flush=True)
-        return "\n".join([f"□ {i+1}. {a['title']}" for i, a in enumerate(articles)])
+        print(f"[WARN] Gemini 요약 또는 JSON 파싱 실패: {e}", flush=True)
+        for i, art in enumerate(articles):
+            html_body += (
+                '<div style="margin-bottom: 20px;">\n'
+                f'    <a href="{art["link"]}" style="text-decoration: none; font-weight: bold; color: #03c75a;">📍 원문보기</a><br>\n'
+                f'    <span style="font-weight: bold;">📌 {art["title"]}</span> - {art["source"]}<br>\n'
+                '    <span>✓ 일시적 서버 오류로 요약을 제공할 수 없습니다.</span>\n'
+                '</div>\n'
+            )
+            
+    return html_body
 
 # ─────────────────────────────────────────────
-# 4) 네이버 메일 전송 로직
+# 4) 네이버 메일 전송 로직 (HTML 적용)
 # ─────────────────────────────────────────────
-def send_naver_mail(subject: str, body: str):
-    """네이버 SMTP 서버를 이용해 이메일 전송"""
+def send_naver_mail(subject: str, html_body: str):
     smtp_server = "smtp.naver.com"
-    smtp_port = 465 # 네이버 SMTP SSL 포트
+    smtp_port = 465 
 
-    # 메일 객체 생성
-    msg = MIMEMultipart()
+    msg = MIMEMultipart("alternative") 
     msg['Subject'] = subject
     msg['From'] = f"{NAVER_ID}@naver.com"
     msg['To'] = RECIPIENT_EMAIL
 
-    # 메일 본문 첨부
-    msg.attach(MIMEText(body, 'plain'))
+    msg.attach(MIMEText(html_body, 'html', 'utf-8'))
 
     try:
-        # SMTP 서버 연결 및 전송
         with smtplib.SMTP_SSL(smtp_server, smtp_port) as server:
             server.login(NAVER_ID, NAVER_APP_PW)
             server.send_message(msg)
@@ -186,26 +226,19 @@ def send_naver_mail(subject: str, body: str):
 # ─────────────────────────────────────────────
 def main():
     kst = timezone(timedelta(hours=9))
-    today = datetime.now(kst).strftime("%Y-%m-%d (%a)")
+    today_str = datetime.now(kst).strftime("%Y-%m-%d (%a)")
 
-    print(f"[1/3] 뉴스 수집 시작 - {today}", flush=True)
+    print(f"[1/3] 뉴스 수집 시작 - {today_str}", flush=True)
     articles = collect_filtered_articles(max_total=8)
     print(f"      → 필터 통과 기사 {len(articles)}건", flush=True)
 
-    print("[2/3] Gemini 요약", flush=True)
-    summary = summarize_with_gemini(articles)
+    print("[2/3] Gemini 요약 및 HTML 렌더링", flush=True)
+    html_output = summarize_with_gemini_to_html(articles, today_str)
 
     print("[3/3] 네이버 메일 전송", flush=True)
-    subject = f"📰 {today} AI 언론 동향 뉴스 리포트"
+    subject = f"📰 {today_str} AI 언론 동향 뉴스 리포트"
+    send_naver_mail(subject, html_output)
     
-    if articles:
-        body = summary + "\n\n[원문 링크]\n" + "\n".join(
-            [f"□ {i+1}. {a['link']}" for i, a in enumerate(articles)]
-        )
-    else:
-        body = summary
-
-    send_naver_mail(subject, body)
     print("[DONE] 모든 작업 완료", flush=True)
 
 if __name__ == "__main__":
